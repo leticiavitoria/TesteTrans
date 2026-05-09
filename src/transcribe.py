@@ -30,7 +30,19 @@ def transcribe(audio_path: str, model_size: str = "large-v3") -> tuple[list[Word
         file=sys.stderr,
         flush=True,
     )
-    model = WhisperModel(model_size, device=device, compute_type=compute_type)
+    try:
+        model = WhisperModel(model_size, device=device, compute_type=compute_type)
+    except RuntimeError as exc:
+        msg = str(exc).lower()
+        if device != "cpu" and ("cuda" in msg or "cudnn" in msg or "gpu" in msg):
+            print(
+                f"Aviso: GPU indisponível ({exc}). Usando CPU.",
+                file=sys.stderr,
+                flush=True,
+            )
+            model = WhisperModel(model_size, device="cpu", compute_type="int8")
+        else:
+            raise
 
     print("Iniciando transcricao (em CPU pode demorar varios minutos por minuto de audio)...",
           file=sys.stderr, flush=True)
