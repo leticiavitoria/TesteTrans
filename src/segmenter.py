@@ -12,6 +12,7 @@ EXT_DURATION = 7.0
 MAX_EXT_PER_SCENE = 20
 MAX_SCENE_DURATION = BASE_DURATION + MAX_EXT_PER_SCENE * EXT_DURATION  # 148s
 SNAP_TOLERANCE = 1.0  # segundos de tolerancia no snap ao fim de palavra
+MIN_SCENE_DURATION = 6.0  # cut_points mais perto que isso do inicio da cena sao ignorados
 
 
 @dataclass
@@ -70,10 +71,11 @@ def _text_between(words: list[Word], start: float, end: float) -> str:
     return " ".join(chunk).strip()
 
 
-def _next_cut_after(cut_points: list[float], lo: float) -> float | None:
-    """Retorna o primeiro cut_point estritamente apos `lo`, ou None."""
+def _next_cut_after(cut_points: list[float], lo: float, min_offset: float = 0.0) -> float | None:
+    """Retorna o primeiro cut_point estritamente apos `lo + min_offset`, ou None."""
+    threshold = lo + max(min_offset, 1e-6)
     for cp in cut_points:
-        if cp > lo + 1e-6:
+        if cp > threshold:
             return cp
     return None
 
@@ -101,7 +103,7 @@ def build_scenes(words: list[Word], cut_points: list[float] | None = None) -> li
         base_target = scene_start + BASE_DURATION
         forced_close = False
 
-        cp = _next_cut_after(cut_points, scene_start)
+        cp = _next_cut_after(cut_points, scene_start, min_offset=MIN_SCENE_DURATION)
         if cp is not None and cp <= base_target + SNAP_TOLERANCE:
             base_target = cp
             forced_close = True
@@ -135,9 +137,9 @@ def build_scenes(words: list[Word], cut_points: list[float] | None = None) -> li
             if ext_target > audio_end:
                 ext_target = audio_end
 
-            cp = _next_cut_after(cut_points, cursor)
+            cp = _next_cut_after(cut_points, scene_start, min_offset=MIN_SCENE_DURATION)
             close_after_this = False
-            if cp is not None and cp <= ext_target + SNAP_TOLERANCE:
+            if cp is not None and cursor < cp <= ext_target + SNAP_TOLERANCE:
                 ext_target = cp
                 close_after_this = True
 

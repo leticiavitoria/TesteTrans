@@ -69,55 +69,81 @@ _ITEM_NUMBER_WORDS = {
 def detect_item_boundaries(words: list[Word]) -> list[float]:
     """Detecta inicios de itens de lista TOP-N na transcricao.
 
-    Procura padroes como "10.", "Number 10", "10 -", "Decimo lugar", etc.
-    Retorna timestamps onde cada NOVO item comeca (= onde a cena anterior
-    deve terminar).
+    Estrategia: procurar uma SEQUENCIA DESCENDENTE de numeros (10 → 9 → 8 → ... → 1)
+    em contexto de anuncio de item. Cada numero so e aceito se:
+      - For exatamente o esperado (anterior - 1), OU
+      - For o primeiro numero "alto" (>= 3) encontrado no audio
+    e tiver contexto de titulo (palavra seguinte capitalizada / proper noun).
+
+    Isso elimina falsos positivos como "10 tons", "1 ,000 years", "2 .8 billion",
+    "3 ,100 degrees", "8 ,000 BCE", "11 ,600 years", "1994", etc.
     """
-    boundaries: list[float] = []
     n = len(words)
-    seen_numbers: set[int] = set()
+    candidates: list[tuple[int, float]] = []  # (numero, timestamp)
 
     for i, w in enumerate(words):
-        token = w.text.strip().rstrip(".,;:!?").lower()
-        # Padrao "10.", "9.", etc. (numero seguido de ponto na mesma palavra)
-        m = re.match(r"^(\d{1,2})\.?$", token)
+        token = w.text.strip().rstrip(".,;:!?\"'").lower()
         num: int | None = None
-        if m:
-            try:
-                num = int(m.group(1))
-            except ValueError:
-                num = None
-            # "10." sozinho como anuncio de item: numero entre 1 e 20.
-            if num is not None and 1 <= num <= 20:
-                # Filtra falsos positivos: anos (1994), porcentagens, etc.
-                # Heuristica: a palavra anterior NAO deve ser preposicao/numero.
-                prev = words[i - 1].text.lower().rstrip(".,") if i > 0 else ""
-                if prev in {"in", "on", "at", "by", "of", "from", "to", "em", "no", "na", "de", "do", "da"}:
-                    num = None
+        boundary_idx = i  # palavra onde a cena nova comeca
 
-        # Padrao "Number 10", "Numero 10"
-        if num is None and token in {"number", "numero", "número", "no"} and i + 1 < n:
-            nxt = words[i + 1].text.strip().rstrip(".,;:!?").lower()
-            m = re.match(r"^(\d{1,2})$", nxt)
+        # Padrao "Number 10", "Numero 10" — fronteira na palavra "Number"
+        if token in {"number", "numero", "número"} and i + 1 < n:
+            nxt_token = words[i + 1].text.strip().rstrip(".,;:!?\"'").lower()
+            m = re.match(r"^(\d{1,2})$", nxt_token)
             if m:
-                try:
-                    cand = int(m.group(1))
-                    if 1 <= cand <= 20:
-                        num = cand
-                except ValueError:
-                    pass
+                cand = int(m.group(1))
+                if 1 <= cand <= 20:
+                    num = cand
+                    boundary_idx = i  # cena nova comeca em "Number"
 
-        # Padrao "decimo", "primeiro", etc.
+        # Padrao "10.", "9.", etc. — numero isolado, possivelmente com ponto
+        if num is None:
+            m = re.match(r"^(\d{1,2})\.?$", token)
+            if m:
+                cand = int(m.group(1))
+                if 1 <= cand <= 20:
+                    # Exige contexto de titulo: a proxima palavra deve comecar
+                    # com letra maiuscula (proper noun) — descarta "10 tons", "10 to 20".
+                    nxt_raw = words[i + 1].text.strip() if i + 1 < n else ""
+                    nxt_first = nxt_raw[:1]
+                    if nxt_first.isalpha() and nxt_first.isupper():
+                        # Exige tambem que a palavra original termine com "." ou que
+                        # exista uma pausa antes (>= 0.4s desde a palavra anterior),
+                        # indicando que e fim de frase / anuncio, nao numero corrido.
+                        ends_with_dot = w.text.strip().endswith(".")
+                        prev_end = words[i - 1].end if i > 0 else w.start
+                        gap = w.start - prev_end
+                        if ends_with_dot or gap >= 0.4:
+                            num = cand
+                            boundary_idx = i
+
+        # Padrao "decimo lugar", "tenth place"
         if num is None and token in _ITEM_NUMBER_WORDS:
-            # Espera por contexto tipo "decimo lugar", "tenth place"
             nxt = words[i + 1].text.lower().rstrip(".,") if i + 1 < n else ""
             if nxt in {"lugar", "place", "posicao", "posição"}:
                 num = _ITEM_NUMBER_WORDS[token]
+                boundary_idx = i
 
-        if num is None or num in seen_numbers:
-            continue
-        seen_numbers.add(num)
-        boundaries.append(w.start)
+        if num is not None:
+            candidates.append((num, words[boundary_idx].start))
+
+    # Filtra mantendo apenas a sequencia descendente coerente.
+    # Procuramos a maior subsequencia que comeca com um numero >= 3
+    # e desce de 1 em 1 (10, 9, 8, ... ou 5, 4, 3, ...).
+    boundaries: list[float] = []
+    expected: int | None = None
+    for num, ts in candidates:
+        if expected is None:
+            # So aceita iniciar com numero "alto" (>=3) para evitar falso match
+            # em listas curtas com "1." espurio.
+            if num >= 3:
+                expected = num
+                boundaries.append(ts)
+                expected -= 1
+        elif num == expected:
+            boundaries.append(ts)
+            expected -= 1
+        # ignora qualquer numero fora de sequencia (ex.: "10 tons" depois de ja ter visto "9.")
 
     return boundaries
 
