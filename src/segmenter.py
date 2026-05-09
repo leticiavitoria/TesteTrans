@@ -56,7 +56,6 @@ def _snap_word_end(words: list[Word], target: float, lo: float) -> tuple[float, 
     # Sem palavra na janela: corta no target, mas nao alem do fim da ultima palavra.
     last_end = words[-1].end if words else target
     cut = min(target, last_end)
-    # encontra a ultima palavra cujo end <= cut
     last_included = -1
     for i, w in enumerate(words):
         if w.end <= cut:
@@ -71,17 +70,21 @@ def _text_between(words: list[Word], start: float, end: float) -> str:
     return " ".join(chunk).strip()
 
 
-def _pick_cut_in_window(
-    cut_points: list[float], window_start: float, window_end: float
-) -> float | None:
-    """Retorna o cut_point dentro da janela, se houver."""
+def _next_cut_after(cut_points: list[float], lo: float) -> float | None:
+    """Retorna o primeiro cut_point estritamente apos `lo`, ou None."""
     for cp in cut_points:
-        if window_start < cp <= window_end:
+        if cp > lo + 1e-6:
             return cp
     return None
 
 
 def build_scenes(words: list[Word], cut_points: list[float] | None = None) -> list[Scene]:
+    """Constroi cenas respeitando os cut_points como tempos EXATOS de fim de cena.
+
+    Quando um cut_point cai dentro do que seria a janela do BASE ou de um EXT, o
+    prompt e truncado no proprio cut_point (snap ao fim de palavra mais proximo)
+    e a proxima cena comeca exatamente nessa fronteira.
+    """
     if not words:
         return []
     cut_points = sorted(cut_points or [])
@@ -94,11 +97,19 @@ def build_scenes(words: list[Word], cut_points: list[float] | None = None) -> li
         scene = Scene()
         scene_start = cursor
 
-        # BASE
+        # BASE: alvo padrao = +8s, mas pode ser truncado por cut_point
         base_target = scene_start + BASE_DURATION
+        forced_close = False
+
+        cp = _next_cut_after(cut_points, scene_start)
+        if cp is not None and cp <= base_target + SNAP_TOLERANCE:
+            base_target = cp
+            forced_close = True
+
         base_end, _ = _snap_word_end(words, target=base_target, lo=scene_start)
         if base_end <= scene_start:
-            base_end = min(scene_start + BASE_DURATION, audio_end)
+            base_end = min(base_target, audio_end)
+
         scene.prompts.append(
             Prompt(
                 start=scene_start,
@@ -109,11 +120,6 @@ def build_scenes(words: list[Word], cut_points: list[float] | None = None) -> li
         )
         cursor = base_end
 
-        # Se sugestao de corte cai dentro da BASE, fecha cena ja.
-        forced_close = False
-        if _pick_cut_in_window(cut_points, scene_start, base_end) is not None:
-            forced_close = True
-
         # EXTs
         ext_count = 0
         while (
@@ -123,12 +129,17 @@ def build_scenes(words: list[Word], cut_points: list[float] | None = None) -> li
             and (cursor - scene_start) < MAX_SCENE_DURATION - 1e-6
         ):
             ext_target = cursor + EXT_DURATION
-            # respeita o limite duro de 148s
             scene_hard_limit = scene_start + MAX_SCENE_DURATION
             if ext_target > scene_hard_limit:
                 ext_target = scene_hard_limit
             if ext_target > audio_end:
                 ext_target = audio_end
+
+            cp = _next_cut_after(cut_points, cursor)
+            close_after_this = False
+            if cp is not None and cp <= ext_target + SNAP_TOLERANCE:
+                ext_target = cp
+                close_after_this = True
 
             ext_end, _ = _snap_word_end(words, target=ext_target, lo=cursor)
             if ext_end <= cursor:
@@ -145,8 +156,7 @@ def build_scenes(words: list[Word], cut_points: list[float] | None = None) -> li
             cursor = ext_end
             ext_count += 1
 
-            # Se o LLM sugeriu um corte dentro deste EXT, encerra a cena (com >=1 EXT).
-            if _pick_cut_in_window(cut_points, scene.prompts[-1].start, ext_end) is not None:
+            if close_after_this:
                 break
 
         scenes.append(scene)

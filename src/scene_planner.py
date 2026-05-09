@@ -52,12 +52,102 @@ def _log(msg: str) -> None:
     print(f"[scene_planner] {msg}", file=sys.stderr, flush=True)
 
 
+_ITEM_NUMBER_WORDS = {
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+    "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+    "um": 1, "dois": 2, "tres": 3, "três": 3, "quatro": 4, "cinco": 5,
+    "seis": 6, "sete": 7, "oito": 8, "nove": 9, "dez": 10,
+    "primeiro": 1, "primeira": 1, "segundo": 2, "segunda": 2,
+    "terceiro": 3, "terceira": 3, "quarto": 4, "quarta": 4,
+    "quinto": 5, "quinta": 5, "sexto": 6, "sexta": 6,
+    "setimo": 7, "sétimo": 7, "setima": 7, "sétima": 7,
+    "oitavo": 8, "oitava": 8, "nono": 9, "nona": 9,
+    "decimo": 10, "décimo": 10, "decima": 10, "décima": 10,
+}
+
+
+def detect_item_boundaries(words: list[Word]) -> list[float]:
+    """Detecta inicios de itens de lista TOP-N na transcricao.
+
+    Procura padroes como "10.", "Number 10", "10 -", "Decimo lugar", etc.
+    Retorna timestamps onde cada NOVO item comeca (= onde a cena anterior
+    deve terminar).
+    """
+    boundaries: list[float] = []
+    n = len(words)
+    seen_numbers: set[int] = set()
+
+    for i, w in enumerate(words):
+        token = w.text.strip().rstrip(".,;:!?").lower()
+        # Padrao "10.", "9.", etc. (numero seguido de ponto na mesma palavra)
+        m = re.match(r"^(\d{1,2})\.?$", token)
+        num: int | None = None
+        if m:
+            try:
+                num = int(m.group(1))
+            except ValueError:
+                num = None
+            # "10." sozinho como anuncio de item: numero entre 1 e 20.
+            if num is not None and 1 <= num <= 20:
+                # Filtra falsos positivos: anos (1994), porcentagens, etc.
+                # Heuristica: a palavra anterior NAO deve ser preposicao/numero.
+                prev = words[i - 1].text.lower().rstrip(".,") if i > 0 else ""
+                if prev in {"in", "on", "at", "by", "of", "from", "to", "em", "no", "na", "de", "do", "da"}:
+                    num = None
+
+        # Padrao "Number 10", "Numero 10"
+        if num is None and token in {"number", "numero", "número", "no"} and i + 1 < n:
+            nxt = words[i + 1].text.strip().rstrip(".,;:!?").lower()
+            m = re.match(r"^(\d{1,2})$", nxt)
+            if m:
+                try:
+                    cand = int(m.group(1))
+                    if 1 <= cand <= 20:
+                        num = cand
+                except ValueError:
+                    pass
+
+        # Padrao "decimo", "primeiro", etc.
+        if num is None and token in _ITEM_NUMBER_WORDS:
+            # Espera por contexto tipo "decimo lugar", "tenth place"
+            nxt = words[i + 1].text.lower().rstrip(".,") if i + 1 < n else ""
+            if nxt in {"lugar", "place", "posicao", "posição"}:
+                num = _ITEM_NUMBER_WORDS[token]
+
+        if num is None or num in seen_numbers:
+            continue
+        seen_numbers.add(num)
+        boundaries.append(w.start)
+
+    return boundaries
+
+
 def suggest_cut_points(words: list[Word], language: str = "auto") -> list[float]:
     """Retorna lista de segundos sugeridos para encerrar cenas.
 
-    Em caso de falha retorna lista vazia, mas registra o motivo no stderr
-    para que o usuario saiba por que nao houve corte inteligente.
+    Combina deteccao deterministica de fronteiras de item (regex) com
+    sugestoes do Claude para sub-contextos dentro de cada item. As
+    fronteiras de item sao SEMPRE incluidas, mesmo se o Claude falhar.
     """
+    item_cuts = detect_item_boundaries(words)
+    if item_cuts:
+        _log(f"Detectadas {len(item_cuts)} fronteiras de item via regex: "
+             f"{[f'{c:.1f}s' for c in item_cuts]}")
+
+    llm_cuts = _suggest_cut_points_llm(words, language=language)
+
+    merged = sorted(set(round(c, 2) for c in (item_cuts + llm_cuts)))
+    # Remove duplicatas proximas (< 1.5s) preferindo a fronteira deterministica
+    deduped: list[float] = []
+    for c in merged:
+        if deduped and c - deduped[-1] < 1.5:
+            continue
+        deduped.append(c)
+    return deduped
+
+
+def _suggest_cut_points_llm(words: list[Word], language: str = "auto") -> list[float]:
+    """Pede ao Claude cortes adicionais. Retorna [] em caso de falha."""
     if not words:
         return []
 
@@ -115,8 +205,8 @@ def suggest_cut_points(words: list[Word], language: str = "auto") -> list[float]
     try:
         data = json.loads(match.group(0))
         cuts = sorted(float(c) for c in data.get("cut_points_seconds", []) if isinstance(c, (int, float)))
-        _log(f"Claude sugeriu {len(cuts)} pontos de corte.")
+        _log(f"Claude sugeriu {len(cuts)} pontos de corte adicionais.")
         return cuts
     except (json.JSONDecodeError, TypeError, ValueError) as exc:
-        _log(f"JSON invalido do Claude ({exc}) — usando heuristica.")
+        _log(f"JSON invalido do Claude ({exc}) — ignorando sugestao do LLM.")
         return []
