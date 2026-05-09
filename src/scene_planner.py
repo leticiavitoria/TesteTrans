@@ -148,12 +148,14 @@ def detect_item_boundaries(words: list[Word]) -> list[float]:
     return boundaries
 
 
-def suggest_cut_points(words: list[Word], language: str = "auto") -> list[float]:
-    """Retorna lista de segundos sugeridos para encerrar cenas.
+def suggest_cut_points(words: list[Word], language: str = "auto") -> tuple[list[float], list[float]]:
+    """Retorna (item_cuts, soft_cuts).
 
-    Combina deteccao deterministica de fronteiras de item (regex) com
-    sugestoes do Claude para sub-contextos dentro de cada item. As
-    fronteiras de item sao SEMPRE incluidas, mesmo se o Claude falhar.
+    - item_cuts: fronteiras OBRIGATORIAS entre itens da lista TOP-N (regex).
+      Podem encurtar o prompt anterior abaixo do minimo, para que o BASE
+      da nova cena comece exatamente no anuncio do item.
+    - soft_cuts: sugestoes do Claude para sub-contextos. Respeitam a
+      duracao minima do prompt (so disparam fechamento dentro da janela 7-8s).
     """
     item_cuts = detect_item_boundaries(words)
     if item_cuts:
@@ -162,14 +164,15 @@ def suggest_cut_points(words: list[Word], language: str = "auto") -> list[float]
 
     llm_cuts = _suggest_cut_points_llm(words, language=language)
 
-    merged = sorted(set(round(c, 2) for c in (item_cuts + llm_cuts)))
-    # Remove duplicatas proximas (< 1.5s) preferindo a fronteira deterministica
-    deduped: list[float] = []
-    for c in merged:
-        if deduped and c - deduped[-1] < 1.5:
+    # Remove cortes do LLM que estao muito proximos de uma fronteira de item
+    # (a fronteira deterministica ja faz o mesmo papel).
+    soft_cuts: list[float] = []
+    for c in llm_cuts:
+        if any(abs(c - ic) < 1.5 for ic in item_cuts):
             continue
-        deduped.append(c)
-    return deduped
+        soft_cuts.append(c)
+
+    return sorted(item_cuts), sorted(soft_cuts)
 
 
 def _suggest_cut_points_llm(words: list[Word], language: str = "auto") -> list[float]:
