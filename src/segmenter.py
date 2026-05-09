@@ -1,4 +1,4 @@
-"""Divide a transcricao em cenas e prompts respeitando 8s/7s/148s."""
+"""Divide a transcricao em cenas e prompts. Cada prompt dura entre 7 e 8 segundos."""
 
 from __future__ import annotations
 
@@ -7,12 +7,11 @@ from dataclasses import dataclass, field
 from .transcribe import Word
 
 
-BASE_DURATION = 8.0
-EXT_DURATION = 7.0
+PROMPT_MIN = 7.0
+PROMPT_MAX = 8.0
 MAX_EXT_PER_SCENE = 20
-MAX_SCENE_DURATION = BASE_DURATION + MAX_EXT_PER_SCENE * EXT_DURATION  # 148s
-SNAP_TOLERANCE = 1.0  # segundos de tolerancia no snap ao fim de palavra
-MIN_SCENE_DURATION = 6.0  # cut_points mais perto que isso do inicio da cena sao ignorados
+MAX_SCENE_DURATION = PROMPT_MAX + MAX_EXT_PER_SCENE * PROMPT_MAX  # 168s
+MIN_SCENE_DURATION = PROMPT_MIN  # cut_points mais perto que isso do inicio da cena sao ignorados
 
 
 @dataclass
@@ -28,42 +27,36 @@ class Scene:
     prompts: list[Prompt] = field(default_factory=list)
 
 
-def _snap_word_end(words: list[Word], target: float, lo: float) -> tuple[float, int]:
-    """Devolve (tempo_de_corte, indice_da_ultima_palavra_incluida).
+def _snap_word_end_in_range(
+    words: list[Word], lo: float, win_start: float, win_end: float
+) -> float:
+    """Devolve o melhor instante para terminar um prompt cujo inicio e `lo`.
 
-    Procura o fim de palavra mais proximo de `target` dentro de [target-tol, target+tol]
-    e estritamente apos `lo` (para garantir progresso). Se nao houver palavra
-    nessa janela, corta exatamente em `target` (ou no fim da ultima palavra,
-    o que for menor).
+    Procura o fim de palavra dentro de [win_start, win_end] que esteja mais
+    proximo do meio da janela (ou seja, ~7.5s apos o inicio). Se nenhuma
+    palavra terminar nessa janela, devolve win_end (corte forcado no maximo).
     """
-    tol = SNAP_TOLERANCE
-    best_idx = -1
+    target = (win_start + win_end) / 2.0
+    best_end = -1.0
     best_diff = float("inf")
-    for i, w in enumerate(words):
+    for w in words:
         if w.end <= lo:
             continue
-        if w.end > target + tol:
+        if w.end > win_end + 1e-6:
             break
-        if w.end < target - tol:
+        if w.end < win_start - 1e-6:
             continue
         diff = abs(w.end - target)
         if diff < best_diff:
             best_diff = diff
-            best_idx = i
+            best_end = w.end
 
-    if best_idx >= 0:
-        return words[best_idx].end, best_idx
+    if best_end > 0:
+        return best_end
 
-    # Sem palavra na janela: corta no target, mas nao alem do fim da ultima palavra.
-    last_end = words[-1].end if words else target
-    cut = min(target, last_end)
-    last_included = -1
-    for i, w in enumerate(words):
-        if w.end <= cut:
-            last_included = i
-        else:
-            break
-    return cut, last_included
+    # Sem fim de palavra na janela: corta no win_end (limite duro de 8s).
+    last_end = words[-1].end if words else win_end
+    return min(win_end, last_end)
 
 
 def _text_between(words: list[Word], start: float, end: float) -> str:
@@ -80,12 +73,44 @@ def _next_cut_after(cut_points: list[float], lo: float, min_offset: float = 0.0)
     return None
 
 
-def build_scenes(words: list[Word], cut_points: list[float] | None = None) -> list[Scene]:
-    """Constroi cenas respeitando os cut_points como tempos EXATOS de fim de cena.
+def _build_prompt_end(
+    words: list[Word],
+    prompt_start: float,
+    audio_end: float,
+    cut_points: list[float],
+    scene_start: float,
+    is_base: bool,
+) -> tuple[float, bool]:
+    """Decide onde este prompt (BASE ou EXT) termina.
 
-    Quando um cut_point cai dentro do que seria a janela do BASE ou de um EXT, o
-    prompt e truncado no proprio cut_point (snap ao fim de palavra mais proximo)
-    e a proxima cena comeca exatamente nessa fronteira.
+    Retorna (end_time, close_scene_after). O prompt sempre dura entre PROMPT_MIN
+    e PROMPT_MAX segundos, exceto se o audio acabar antes.
+    """
+    win_start = prompt_start + PROMPT_MIN
+    win_end = prompt_start + PROMPT_MAX
+
+    close_after = False
+    cp = _next_cut_after(cut_points, scene_start, min_offset=MIN_SCENE_DURATION)
+    if cp is not None and prompt_start < cp <= win_end:
+        # Cut_point cai dentro da janela do prompt — fecha cena no fim deste prompt
+        # (mas o prompt ainda dura entre 7 e 8s, snap dentro da janela).
+        close_after = True
+    elif cp is not None and cp <= prompt_start:
+        # Cut_point ja foi atingido em prompts anteriores; tambem fecha.
+        close_after = True
+
+    end = _snap_word_end_in_range(words, lo=prompt_start, win_start=win_start, win_end=win_end)
+    if end > audio_end:
+        end = audio_end
+    if end <= prompt_start:
+        end = min(prompt_start + PROMPT_MAX, audio_end)
+
+    return end, close_after
+
+
+def build_scenes(words: list[Word], cut_points: list[float] | None = None) -> list[Scene]:
+    """Constroi cenas. Cada prompt dura 7-8s. Cut_points fecham a cena no
+    proximo prompt cuja janela [start+7, start+8] contem o cut_point.
     """
     if not words:
         return []
@@ -99,19 +124,15 @@ def build_scenes(words: list[Word], cut_points: list[float] | None = None) -> li
         scene = Scene()
         scene_start = cursor
 
-        # BASE: alvo padrao = +8s, mas pode ser truncado por cut_point
-        base_target = scene_start + BASE_DURATION
-        forced_close = False
-
-        cp = _next_cut_after(cut_points, scene_start, min_offset=MIN_SCENE_DURATION)
-        if cp is not None and cp <= base_target + SNAP_TOLERANCE:
-            base_target = cp
-            forced_close = True
-
-        base_end, _ = _snap_word_end(words, target=base_target, lo=scene_start)
-        if base_end <= scene_start:
-            base_end = min(base_target, audio_end)
-
+        # BASE
+        base_end, close_after_base = _build_prompt_end(
+            words,
+            prompt_start=scene_start,
+            audio_end=audio_end,
+            cut_points=cut_points,
+            scene_start=scene_start,
+            is_base=True,
+        )
         scene.prompts.append(
             Prompt(
                 start=scene_start,
@@ -125,28 +146,19 @@ def build_scenes(words: list[Word], cut_points: list[float] | None = None) -> li
         # EXTs
         ext_count = 0
         while (
-            not forced_close
+            not close_after_base
             and ext_count < MAX_EXT_PER_SCENE
             and cursor < audio_end - 1e-6
             and (cursor - scene_start) < MAX_SCENE_DURATION - 1e-6
         ):
-            ext_target = cursor + EXT_DURATION
-            scene_hard_limit = scene_start + MAX_SCENE_DURATION
-            if ext_target > scene_hard_limit:
-                ext_target = scene_hard_limit
-            if ext_target > audio_end:
-                ext_target = audio_end
-
-            cp = _next_cut_after(cut_points, scene_start, min_offset=MIN_SCENE_DURATION)
-            close_after_this = False
-            if cp is not None and cursor < cp <= ext_target + SNAP_TOLERANCE:
-                ext_target = cp
-                close_after_this = True
-
-            ext_end, _ = _snap_word_end(words, target=ext_target, lo=cursor)
-            if ext_end <= cursor:
-                ext_end = min(ext_target, audio_end)
-
+            ext_end, close_after = _build_prompt_end(
+                words,
+                prompt_start=cursor,
+                audio_end=audio_end,
+                cut_points=cut_points,
+                scene_start=scene_start,
+                is_base=False,
+            )
             scene.prompts.append(
                 Prompt(
                     start=cursor,
@@ -158,7 +170,7 @@ def build_scenes(words: list[Word], cut_points: list[float] | None = None) -> li
             cursor = ext_end
             ext_count += 1
 
-            if close_after_this:
+            if close_after:
                 break
 
         scenes.append(scene)
