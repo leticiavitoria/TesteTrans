@@ -12,15 +12,27 @@ from .transcribe import Word
 
 SYSTEM_PROMPT = (
     "Voce recebe a transcricao de um audio com timestamps por palavra. "
-    "Sua tarefa e identificar bons momentos para encerrar uma CENA narrativa. "
-    "Bons cortes acontecem em: mudanca de topico, fim de ideia clara, "
-    "introducao de novo capitulo/item de lista, pergunta-retorica seguida de resposta, "
-    "pausa longa, virada emocional. Evite cortar no meio de uma frase. "
-    "Use o conteudo do texto como guia principal — uma cena pode ser curta (poucos segundos) "
-    "ou longa (varios minutos). Nao force cenas de tamanho similar. "
+    "O audio costuma ser um video de lista TOP-N (Top 10, Top 5, etc). "
+    "Sua tarefa e identificar os instantes onde cada CENA narrativa termina.\n\n"
+    "REGRAS OBRIGATORIAS para audios em formato lista TOP-N:\n"
+    "1. A INTRODUCAO (antes do primeiro item da lista) e SEMPRE uma cena propria. "
+    "Encerre-a no instante imediatamente ANTES do narrador anunciar o primeiro item "
+    "(ex.: \"10.\", \"Number 10\", \"In tenth place\", \"Decimo lugar\").\n"
+    "2. CADA ITEM da lista (10, 9, 8, ... 1) deve iniciar uma NOVA cena. "
+    "Coloque um cut_point no instante imediatamente ANTES do narrador anunciar o numero/titulo do proximo item. "
+    "Exemplo: se o item 9 comeca aos 245.3s com \"9. Roman dodecahedra\", "
+    "entao o cut_point que encerra a cena do item 10 deve ser ~245.3s "
+    "(ou no fim da palavra anterior, para nao cortar no meio de frase).\n"
+    "3. O FECHAMENTO/OUTRO (recapitulacao, call-to-action, despedida apos o item 1) "
+    "deve ser uma cena propria.\n\n"
+    "REGRAS GERAIS:\n"
+    "- Nao corte no meio de uma frase. Prefira o fim da sentenca anterior ao titulo do novo item.\n"
+    "- Cenas podem ter durações muito diferentes (alguns segundos ou varios minutos). NAO force tamanhos similares.\n"
+    "- Se algum item for muito longo, voce PODE adicionar cortes internos em mudancas de subtopico, "
+    "mas a prioridade absoluta e marcar a fronteira entre itens.\n\n"
     "Responda APENAS com JSON valido no formato: "
     '{\"cut_points_seconds\": [12.4, 31.7, ...]} '
-    "onde cada numero e o instante (em segundos) onde a cena DEVE terminar."
+    "onde cada numero e o instante (em segundos) onde uma cena DEVE terminar."
 )
 
 
