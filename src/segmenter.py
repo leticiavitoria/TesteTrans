@@ -57,6 +57,21 @@ def _find_period_end_before(words: list[Word], target: float, max_lookback: floa
     return best
 
 
+def _find_period_end_in_range(words: list[Word], lo: float, hi: float) -> float | None:
+    """Retorna o end time da palavra terminada em '.' mais proxima de `hi`
+    dentro de [lo, hi]. None se nao houver."""
+    best: float | None = None
+    for w in words:
+        if w.end < lo:
+            continue
+        if w.end > hi + 1e-6:
+            break
+        text = w.text.strip()
+        if text.endswith(".") and not text.endswith(".."):
+            best = w.end  # itera ate o fim, ficamos com o ultimo (mais proximo de hi)
+    return best
+
+
 def _find_period_end_after(words: list[Word], target: float, max_lookahead: float) -> float | None:
     """Retorna o end time da primeira palavra terminada em '.' cujo end >= target,
     dentro da janela [target, target + max_lookahead]."""
@@ -121,17 +136,23 @@ def build_scenes(
     scene_starts.append(audio_end)
 
     scenes: list[Scene] = []
-    for i in range(len(scene_starts) - 1):
+    i = 0
+    while i < len(scene_starts) - 1:
         scene_start = scene_starts[i]
         natural_end = scene_starts[i + 1]
 
         # Limita pela duracao maxima da cena (8 + 20*7 = 148s).
         max_end = scene_start + MAX_SCENE_DURATION
-        if natural_end > max_end:
-            # Cena seria longa demais. Tenta achar um ponto final dentro dos
-            # ultimos segundos antes de max_end. Se nao houver, corta em max_end.
-            period = _find_period_end_before(words, max_end, PERIOD_LOOKBACK)
-            scene_end = period if period and period > scene_start + BASE_DURATION else max_end
+        if natural_end > max_end + 1e-6:
+            # A secao entre os boundaries excede a duracao maxima. Insere um
+            # split em um ponto final dentro de [scene_start + 100, max_end]
+            # para nao perder audio. A proxima cena vai comecar no split.
+            split_lo = scene_start + max(BASE_DURATION + EXT_DURATION, MAX_SCENE_DURATION - 30.0)
+            split = _find_period_end_in_range(words, lo=split_lo, hi=max_end)
+            if split is None or split <= scene_start + BASE_DURATION:
+                split = max_end  # fallback: corte duro
+            scene_end = split
+            scene_starts.insert(i + 1, split)
         else:
             scene_end = natural_end
 
@@ -182,5 +203,6 @@ def build_scenes(
             ext_count += 1
 
         scenes.append(scene)
+        i += 1
 
     return scenes
