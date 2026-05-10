@@ -21,6 +21,7 @@ EXT_DURATION = 7.0
 MAX_EXT_PER_SCENE = 20
 MAX_SCENE_DURATION = BASE_DURATION + MAX_EXT_PER_SCENE * EXT_DURATION  # 148s
 PERIOD_LOOKBACK = 4.0  # quanto procuramos para tras de um boundary buscando um ponto final
+EXT_ABSORB_THRESHOLD = 2.0  # se sobrar <= 2s apos uma EXT cheia, a ultima EXT absorve
 
 
 @dataclass
@@ -144,13 +145,27 @@ def build_scenes(
         # Limita pela duracao maxima da cena (8 + 20*7 = 148s).
         max_end = scene_start + MAX_SCENE_DURATION
         if natural_end > max_end + 1e-6:
-            # A secao entre os boundaries excede a duracao maxima. Insere um
-            # split em um ponto final dentro de [scene_start + 100, max_end]
-            # para nao perder audio. A proxima cena vai comecar no split.
-            split_lo = scene_start + max(BASE_DURATION + EXT_DURATION, MAX_SCENE_DURATION - 30.0)
-            split = _find_period_end_in_range(words, lo=split_lo, hi=max_end)
+            # A secao entre os boundaries excede a duracao maxima. Procura um
+            # ponto final perto do MEIO da secao para gerar duas cenas mais
+            # balanceadas. Se a proxima cena ainda for longa demais, o loop
+            # se chama recursivamente (proximo i) e divide de novo.
+            section_len = natural_end - scene_start
+            target = scene_start + section_len / 2.0
+            min_split = scene_start + BASE_DURATION + EXT_DURATION  # garante BASE+1 EXT
+            window = 25.0
+            split = _find_period_end_in_range(
+                words,
+                lo=max(min_split, target - window),
+                hi=min(max_end, target + window),
+            )
+            if split is None:
+                # Alarga a janela de busca para todo o intervalo valido.
+                split = _find_period_end_in_range(words, lo=min_split, hi=max_end)
             if split is None or split <= scene_start + BASE_DURATION:
-                split = max_end  # fallback: corte duro
+                split = max_end  # ultimo recurso: corte duro
+            # Garante que a proxima cena tambem tenha pelo menos BASE_DURATION.
+            if natural_end - split < BASE_DURATION:
+                split = max(min_split, natural_end - BASE_DURATION)
             scene_end = split
             scene_starts.insert(i + 1, split)
         else:
@@ -169,8 +184,14 @@ def build_scenes(
 
         scene = Scene()
 
-        # BASE: 8s exatos (limitado por scene_end se a cena for muito curta).
-        base_end = min(scene_start + BASE_DURATION, scene_end)
+        # BASE: 8s exatos. Excecao: se a cena toda cabe em ate ~10s
+        # (BASE_DURATION + EXT_ABSORB_THRESHOLD), o BASE absorve tudo para
+        # nao gerar uma micro-EXT. Tambem limitado por scene_end em cenas curtas.
+        scene_total = scene_end - scene_start
+        if scene_total <= BASE_DURATION + EXT_ABSORB_THRESHOLD + 1e-6:
+            base_end = scene_end
+        else:
+            base_end = scene_start + BASE_DURATION
         scene.prompts.append(
             Prompt(
                 start=scene_start,
@@ -182,11 +203,13 @@ def build_scenes(
         cursor = base_end
 
         # EXTs de 7s, exceto a ultima que vai ate scene_end.
+        # Se sobrariam <= EXT_ABSORB_THRESHOLD apos uma EXT cheia, a ULTIMA EXT
+        # absorve o residuo (vira EXT de 7 ate 7+THRESHOLD segundos).
         ext_count = 0
         while cursor < scene_end - 1e-6 and ext_count < MAX_EXT_PER_SCENE:
             remaining = scene_end - cursor
-            if remaining <= EXT_DURATION + 1e-6:
-                # Ultima EXT — vai ate scene_end (que ja esta em ponto final).
+            if remaining <= EXT_DURATION + EXT_ABSORB_THRESHOLD + 1e-6:
+                # Ultima EXT — vai ate scene_end (7s..9s ou menor).
                 ext_end = scene_end
             else:
                 # EXT cheia de 7s.

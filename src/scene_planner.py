@@ -10,14 +10,24 @@ import sys
 from .transcribe import Word
 
 
+CLAUDE_MODEL = "claude-opus-4-6"
+MAX_SECTION_DURATION = 148.0  # = BASE_DURATION + MAX_EXT_PER_SCENE * EXT_DURATION
+TARGET_MAX_SECTION = 140.0    # alvo recomendado ao Claude (folga de 8s)
+
+
 SYSTEM_PROMPT = (
     "Voce recebe a transcricao de um audio com timestamps por palavra. "
     "O audio costuma ser um video de lista TOP-N (Top 10, Top 5, etc). "
     "Sua tarefa e identificar os instantes onde cada CENA narrativa termina.\n\n"
+    "REGRA CRITICA E INVIOLAVEL: nenhuma secao entre dois cut_points consecutivos "
+    f"(incluindo as fronteiras de item) pode durar mais de {TARGET_MAX_SECTION:.0f} segundos. "
+    "Se um item da lista TOP-N for mais longo que isso, voce DEVE adicionar cut_points "
+    "intermediarios em pontos de troca clara de sub-contexto narrativo (mudanca de foco, "
+    "de quem fala, de tempo/local da narrativa, fim de uma ideia inteira).\n\n"
     "CONCEITO: cada cena comeca com um prompt BASE e e seguida de extensoes (EXT) "
     "que detalham o MESMO mini-contexto. Quando o mini-contexto muda, uma nova cena "
     "(novo BASE) deve comecar — mesmo que ainda estejamos dentro do mesmo item da lista. "
-    "Pense em cada cena como uma 'unidade visual' que ilustraria um momento especifico do narrativa.\n\n"
+    "Pense em cada cena como uma 'unidade visual' que ilustraria um momento especifico da narrativa.\n\n"
     "REGRAS OBRIGATORIAS para audios em formato lista TOP-N:\n"
     "1. A INTRODUCAO (antes do primeiro item da lista) e SEMPRE pelo menos uma cena propria, "
     "podendo ser quebrada em varias se houver mini-contextos distintos (gancho, previa dos itens, CTA inicial). "
@@ -30,14 +40,14 @@ SYSTEM_PROMPT = (
     "(a) descricao fisica/contexto historico do objeto, "
     "(b) descoberta/escavacao/quem encontrou, "
     "(c) analise cientifica/estudo especifico, "
-    "(d) mistério/teorias concorrentes, "
+    "(d) misterio/teorias concorrentes, "
     "(e) implicacao/conclusao do item. "
     "Itens longos devem virar 3 a 6 cenas. Itens curtos podem ter 1 a 2 cenas.\n"
     "4. O FECHAMENTO/OUTRO (recapitulacao, CTA, despedida apos o item 1) "
     "deve ser pelo menos uma cena propria, possivelmente quebrada em recapitulacao + CTA.\n\n"
     "REGRAS GERAIS:\n"
     "- Nao corte no meio de uma frase. Prefira o fim da sentenca antes do novo mini-contexto.\n"
-    "- Cenas podem ter durações muito diferentes. NAO force tamanhos similares.\n"
+    "- Cenas podem ter duracoes muito diferentes. NAO force tamanhos similares.\n"
     "- O numero TOTAL de cenas deve ser MAIOR que (intro + N itens + outro). "
     "Para um Top 10, espere algo como 25 a 50 cenas no total, nao apenas 12.\n"
     "- Quando estiver em duvida entre cortar ou nao cortar dentro de um item, PREFIRA cortar — "
@@ -45,6 +55,22 @@ SYSTEM_PROMPT = (
     "Responda APENAS com JSON valido no formato: "
     '{\"cut_points_seconds\": [12.4, 31.7, ...]} '
     "onde cada numero e o instante (em segundos) onde uma cena DEVE terminar."
+)
+
+
+LONG_SECTION_SYSTEM_PROMPT = (
+    "Voce recebe um TRECHO da transcricao de um audio que ainda esta longo demais "
+    f"(mais de {MAX_SECTION_DURATION:.0f} segundos). Sua tarefa e propor 1 ou mais "
+    "cut_points DENTRO desse trecho que dividam a narrativa em sub-cenas coerentes, "
+    f"de forma que NENHUMA sub-secao resultante exceda {TARGET_MAX_SECTION:.0f} segundos.\n\n"
+    "Cada cut_point deve cair em uma troca real de sub-contexto narrativo (mudanca de foco, "
+    "de personagem, de tempo, ou fim de uma ideia inteira) — NUNCA no meio de uma frase. "
+    "Use o conteudo do texto como guia: pense em cada sub-cena como uma 'unidade visual' "
+    "distinta. NAO retorne os limites externos do trecho — somente os cortes INTERNOS.\n\n"
+    "Responda APENAS com JSON valido no formato: "
+    '{\"cut_points_seconds\": [12.4, 31.7, ...]} '
+    "onde cada numero e um instante (em segundos absolutos no audio original) onde "
+    "uma sub-cena DEVE terminar."
 )
 
 
@@ -154,8 +180,9 @@ def suggest_cut_points(words: list[Word], language: str = "auto") -> tuple[list[
     - item_cuts: fronteiras OBRIGATORIAS entre itens da lista TOP-N (regex).
       Podem encurtar o prompt anterior abaixo do minimo, para que o BASE
       da nova cena comece exatamente no anuncio do item.
-    - soft_cuts: sugestoes do Claude para sub-contextos. Respeitam a
-      duracao minima do prompt (so disparam fechamento dentro da janela 7-8s).
+    - soft_cuts: sugestoes do Claude para sub-contextos. Inclui uma segunda
+      passada focada em secoes que ainda estao acima de MAX_SECTION_DURATION
+      apos a primeira chamada.
     """
     item_cuts = detect_item_boundaries(words)
     if item_cuts:
@@ -172,7 +199,132 @@ def suggest_cut_points(words: list[Word], language: str = "auto") -> tuple[list[
             continue
         soft_cuts.append(c)
 
+    # Segunda passada: identifica secoes que ainda excedem MAX_SECTION_DURATION
+    # e pede ao Claude cortes coerentes especificamente nelas.
+    extra = _resuggest_for_long_sections(
+        words=words,
+        item_cuts=item_cuts,
+        soft_cuts=soft_cuts,
+        language=language,
+    )
+    if extra:
+        merged = soft_cuts + extra
+        # Dedup contra item_cuts e contra cortes muito proximos entre si.
+        soft_cuts = []
+        for c in sorted(merged):
+            if any(abs(c - ic) < 1.5 for ic in item_cuts):
+                continue
+            if soft_cuts and c - soft_cuts[-1] < 1.5:
+                continue
+            soft_cuts.append(c)
+
     return sorted(item_cuts), sorted(soft_cuts)
+
+
+def _find_long_sections(
+    audio_start: float, audio_end: float, boundaries: list[float]
+) -> list[tuple[float, float]]:
+    """Devolve pares (a, b) onde b - a > MAX_SECTION_DURATION."""
+    starts = sorted({audio_start, audio_end, *boundaries})
+    return [
+        (a, b)
+        for a, b in zip(starts, starts[1:])
+        if b - a > MAX_SECTION_DURATION + 1e-6
+    ]
+
+
+def _resuggest_for_long_sections(
+    words: list[Word],
+    item_cuts: list[float],
+    soft_cuts: list[float],
+    language: str,
+) -> list[float]:
+    """Para cada secao ainda > MAX_SECTION_DURATION, faz uma chamada focada ao
+    Claude pedindo cortes coerentes dentro do trecho. Retorna a lista mesclada
+    de novos cortes (em segundos absolutos).
+    """
+    if not words:
+        return []
+    audio_start = words[0].start
+    audio_end = words[-1].end
+    long_sections = _find_long_sections(
+        audio_start, audio_end, item_cuts + soft_cuts
+    )
+    if not long_sections:
+        return []
+
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        return []
+    try:
+        from anthropic import Anthropic
+    except ImportError:
+        return []
+
+    _log(f"{len(long_sections)} secao(oes) ainda > {MAX_SECTION_DURATION:.0f}s — "
+         f"pedindo segunda passada ao Claude.")
+
+    client = Anthropic(api_key=api_key)
+    new_cuts: list[float] = []
+
+    for sec_start, sec_end in long_sections:
+        section_words = [w for w in words if w.start >= sec_start - 1e-6 and w.end <= sec_end + 1e-6]
+        if not section_words:
+            continue
+
+        transcript_lines = []
+        for w in section_words:
+            mm = int(w.start // 60)
+            ss = w.start - mm * 60
+            transcript_lines.append(f"[{mm:02d}:{ss:05.2f}] {w.text}")
+        transcript = "\n".join(transcript_lines)
+
+        section_len = sec_end - sec_start
+        user_msg = (
+            f"Idioma: {language}. Trecho de {section_len:.1f}s ({sec_start:.1f}s a {sec_end:.1f}s).\n"
+            f"Transcricao do trecho:\n{transcript}\n\n"
+            f"Devolva o JSON com cortes INTERNOS para que nenhuma sub-secao "
+            f"exceda {TARGET_MAX_SECTION:.0f}s."
+        )
+
+        try:
+            resp = client.messages.create(
+                model=CLAUDE_MODEL,
+                max_tokens=1024,
+                system=[
+                    {
+                        "type": "text",
+                        "text": LONG_SECTION_SYSTEM_PROMPT,
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ],
+                messages=[{"role": "user", "content": user_msg}],
+            )
+            text = "".join(
+                block.text for block in resp.content if getattr(block, "type", "") == "text"
+            )
+        except Exception as exc:
+            _log(f"Erro na segunda passada para [{sec_start:.1f}, {sec_end:.1f}]: {exc}")
+            continue
+
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        if not match:
+            continue
+        try:
+            data = json.loads(match.group(0))
+            for c in data.get("cut_points_seconds", []):
+                if not isinstance(c, (int, float)):
+                    continue
+                cf = float(c)
+                # So aceita cortes que estao DENTRO da secao com folga.
+                if sec_start + 5.0 <= cf <= sec_end - 5.0:
+                    new_cuts.append(cf)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            continue
+
+    if new_cuts:
+        _log(f"Segunda passada devolveu {len(new_cuts)} corte(s) adicional(is).")
+    return new_cuts
 
 
 def _suggest_cut_points_llm(words: list[Word], language: str = "auto") -> list[float]:
@@ -209,7 +361,7 @@ def _suggest_cut_points_llm(words: list[Word], language: str = "auto") -> list[f
     try:
         client = Anthropic(api_key=api_key)
         resp = client.messages.create(
-            model="claude-sonnet-4-6",
+            model=CLAUDE_MODEL,
             max_tokens=4096,
             system=[
                 {
