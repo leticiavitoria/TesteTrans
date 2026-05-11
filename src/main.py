@@ -9,7 +9,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from .formatter import format_scenes
-from .scene_planner import detect_item_boundaries, suggest_cut_points
+from .scene_planner import suggest_cut_points
 from .segmenter import build_scenes
 from .transcribe import transcribe
 
@@ -46,17 +46,13 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Idioma detectado: {language}. Palavras: {len(words)}.", file=sys.stderr)
 
     if args.no_llm:
-        item_cuts = detect_item_boundaries(words)
-        soft_cuts: list[float] = []
+        cut_points: list[float] = []
     else:
         print("Consultando Claude para sugerir cortes de cena...", file=sys.stderr)
-        item_cuts, soft_cuts = suggest_cut_points(words, language=language)
-        print(
-            f"Fronteiras de item: {len(item_cuts)}. Sub-cortes: {len(soft_cuts)}.",
-            file=sys.stderr,
-        )
+        cut_points = suggest_cut_points(words, language=language)
+        print(f"Cortes sugeridos: {len(cut_points)}.", file=sys.stderr)
 
-    scenes = build_scenes(words, item_cuts=item_cuts, soft_cuts=soft_cuts)
+    scenes = build_scenes(words, cut_points=cut_points)
     output = format_scenes(scenes)
 
     if args.output:
