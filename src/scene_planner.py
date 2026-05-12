@@ -198,21 +198,22 @@ def _nearest_period_end(
     return best
 
 
-def suggest_cut_points(words: list[Word], language: str = "auto") -> list[float]:
-    """Retorna uma lista unica de cut_points (em segundos), ja snapados para
-    o fim da frase mais proxima. Combina:
+def suggest_cut_points(words: list[Word], language: str = "auto") -> tuple[list[float], list[float]]:
+    """Retorna (item_cuts, soft_cuts), ambos snapados para o fim da frase mais
+    proxima.
 
-    - fronteiras OBRIGATORIAS de item da lista TOP-N (regex deterministico),
-      snapadas para o ponto final imediatamente ANTES do anuncio;
-    - sugestoes do Claude para sub-contextos (snapadas para o ponto final
-      mais proximo; descartadas quando nao ha ponto final na janela);
-    - cortes da segunda passada do Claude para secoes ainda > MAX_SECTION_DURATION.
+    - item_cuts: fronteiras OBRIGATORIAS entre itens da lista TOP-N (regex
+      deterministico). Snapadas para o ponto final imediatamente ANTES do
+      anuncio do item.
+    - soft_cuts: sugestoes do Claude para sub-contextos (snapadas; descartadas
+      quando nao ha ponto final na janela). Inclui segunda passada para
+      secoes ainda > MAX_SECTION_DURATION.
 
     Cortes suaves a menos de MIN_SCENE_DURATION de qualquer fronteira de item
     sao descartados — o anuncio do item sempre vence.
     """
     if not words:
-        return []
+        return [], []
 
     item_cuts_raw = detect_item_boundaries(words)
     if item_cuts_raw:
@@ -268,7 +269,7 @@ def suggest_cut_points(words: list[Word], language: str = "auto") -> list[float]
         deduped.append(c)
     soft_cuts = deduped
 
-    return sorted(set(item_cuts) | set(soft_cuts))
+    return sorted(item_cuts), sorted(soft_cuts)
 
 
 def _drop_close_to_items(soft_cuts: list[float], item_cuts: list[float]) -> list[float]:
