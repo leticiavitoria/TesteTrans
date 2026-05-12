@@ -228,4 +228,12 @@ def build_scenes(
         scenes.append(scene)
         i += 1
 
+    # Descarta cena final vazia ou degenerada (BASE com <1s e sem texto).
+    if scenes:
+        last = scenes[-1]
+        if last.prompts:
+            p0 = last.prompts[0]
+            if p0.end - p0.start < 1.0 and not p0.text.strip():
+                scenes.pop()
+
     return scenes

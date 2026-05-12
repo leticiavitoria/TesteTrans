@@ -112,15 +112,18 @@ def detect_item_boundaries(words: list[Word]) -> list[float]:
         num: int | None = None
         boundary_idx = i  # palavra onde a cena nova comeca
 
-        # Padrao "Number 10", "Numero 10" — fronteira na palavra "Number"
+        # Padrao "Number 10", "Number nine", "Numero dez" — fronteira na palavra "Number"
         if token in {"number", "numero", "número"} and i + 1 < n:
             nxt_token = words[i + 1].text.strip().rstrip(".,;:!?\"'").lower()
+            cand: int | None = None
             m = re.match(r"^(\d{1,2})$", nxt_token)
             if m:
                 cand = int(m.group(1))
-                if 1 <= cand <= 20:
-                    num = cand
-                    boundary_idx = i  # cena nova comeca em "Number"
+            elif nxt_token in _ITEM_NUMBER_WORDS:
+                cand = _ITEM_NUMBER_WORDS[nxt_token]
+            if cand is not None and 1 <= cand <= 20:
+                num = cand
+                boundary_idx = i  # cena nova comeca em "Number"
 
         # Padrao "10.", "9.", etc. — numero isolado, possivelmente com ponto
         if num is None:
@@ -153,23 +156,22 @@ def detect_item_boundaries(words: list[Word]) -> list[float]:
         if num is not None:
             candidates.append((num, words[boundary_idx].start))
 
-    # Filtra mantendo apenas a sequencia descendente coerente.
-    # Procuramos a maior subsequencia que comeca com um numero >= 3
-    # e desce de 1 em 1 (10, 9, 8, ... ou 5, 4, 3, ...).
+    # Filtra mantendo apenas a sequencia estritamente decrescente.
+    # Aceita lacunas (ex.: detectou 10, 8, 3) — basta cada novo numero ser
+    # menor que o ultimo aceito. Descarta "10 tons" depois de ja ter visto "9.".
     boundaries: list[float] = []
-    expected: int | None = None
+    last_accepted: int | None = None
     for num, ts in candidates:
-        if expected is None:
+        if last_accepted is None:
             # So aceita iniciar com numero "alto" (>=3) para evitar falso match
             # em listas curtas com "1." espurio.
             if num >= 3:
-                expected = num
+                last_accepted = num
                 boundaries.append(ts)
-                expected -= 1
-        elif num == expected:
+        elif num < last_accepted:
+            last_accepted = num
             boundaries.append(ts)
-            expected -= 1
-        # ignora qualquer numero fora de sequencia (ex.: "10 tons" depois de ja ter visto "9.")
+        # ignora numeros maiores ou iguais (ex.: "10 tons", "8 ,000 BCE")
 
     return boundaries
 
