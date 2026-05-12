@@ -103,24 +103,19 @@ _ITEM_NUMBER_WORDS = {
 def detect_item_boundaries(words: list[Word]) -> list[float]:
     """Detecta inicios de itens de lista TOP-N na transcricao.
 
-    Estrategia: procurar uma SEQUENCIA DESCENDENTE de numeros (10 → 9 → 8 → ... → 1)
-    em contexto de anuncio de item. Cada numero so e aceito se:
-      - For exatamente o esperado (anterior - 1), OU
-      - For o primeiro numero "alto" (>= 3) encontrado no audio
-    e tiver contexto de titulo (palavra seguinte capitalizada / proper noun).
-
-    Isso elimina falsos positivos como "10 tons", "1 ,000 years", "2 .8 billion",
-    "3 ,100 degrees", "8 ,000 BCE", "11 ,600 years", "1994", etc.
+    Estrategia: procurar uma SEQUENCIA DESCENDENTE de numeros (10 -> 9 -> 8 ... 1)
+    em contexto de anuncio de item. Aceita "Number nine" por extenso e tolera
+    lacunas (apenas exige descendencia estrita).
     """
     n = len(words)
-    candidates: list[tuple[int, float]] = []  # (numero, timestamp)
+    candidates: list[tuple[int, float]] = []
 
     for i, w in enumerate(words):
         token = w.text.strip().rstrip(".,;:!?\"'").lower()
         num: int | None = None
-        boundary_idx = i  # palavra onde a cena nova comeca
+        boundary_idx = i
 
-        # Padrao "Number 10", "Number nine", "Numero dez" — fronteira na palavra "Number"
+        # Padrao "Number 10", "Number nine", "Numero dez"
         if token in {"number", "numero", "número"} and i + 1 < n:
             nxt_token = words[i + 1].text.strip().rstrip(".,;:!?\"'").lower()
             cand: int | None = None
@@ -131,22 +126,17 @@ def detect_item_boundaries(words: list[Word]) -> list[float]:
                 cand = _ITEM_NUMBER_WORDS[nxt_token]
             if cand is not None and 1 <= cand <= 20:
                 num = cand
-                boundary_idx = i  # cena nova comeca em "Number"
+                boundary_idx = i
 
-        # Padrao "10.", "9.", etc. — numero isolado, possivelmente com ponto
+        # Padrao "10.", "9.", etc.
         if num is None:
             m = re.match(r"^(\d{1,2})\.?$", token)
             if m:
                 cand = int(m.group(1))
                 if 1 <= cand <= 20:
-                    # Exige contexto de titulo: a proxima palavra deve comecar
-                    # com letra maiuscula (proper noun) — descarta "10 tons", "10 to 20".
                     nxt_raw = words[i + 1].text.strip() if i + 1 < n else ""
                     nxt_first = nxt_raw[:1]
                     if nxt_first.isalpha() and nxt_first.isupper():
-                        # Exige tambem que a palavra original termine com "." ou que
-                        # exista uma pausa antes (>= 0.4s desde a palavra anterior),
-                        # indicando que e fim de frase / anuncio, nao numero corrido.
                         ends_with_dot = w.text.strip().endswith(".")
                         prev_end = words[i - 1].end if i > 0 else w.start
                         gap = w.start - prev_end
@@ -164,22 +154,16 @@ def detect_item_boundaries(words: list[Word]) -> list[float]:
         if num is not None:
             candidates.append((num, words[boundary_idx].start))
 
-    # Filtra mantendo apenas a sequencia estritamente decrescente.
-    # Aceita lacunas (ex.: detectou 10, 8, 3) — basta cada novo numero ser
-    # menor que o ultimo aceito. Descarta "10 tons" depois de ja ter visto "9.".
     boundaries: list[float] = []
     last_accepted: int | None = None
     for num, ts in candidates:
         if last_accepted is None:
-            # So aceita iniciar com numero "alto" (>=3) para evitar falso match
-            # em listas curtas com "1." espurio.
             if num >= 3:
                 last_accepted = num
                 boundaries.append(ts)
         elif num < last_accepted:
             last_accepted = num
             boundaries.append(ts)
-        # ignora numeros maiores ou iguais (ex.: "10 tons", "8 ,000 BCE")
 
     return boundaries
 
@@ -195,8 +179,7 @@ def _nearest_period_end(
     words: list[Word], target: float, lookback: float, lookahead: float
 ) -> float | None:
     """Retorna o end-time da palavra terminada em '.', '!' ou '?' mais proxima
-    de `target` dentro de [target - lookback, target + lookahead].
-    None se nao houver."""
+    de `target` dentro de [target - lookback, target + lookahead]."""
     lo = target - lookback
     hi = target + lookahead
     best: float | None = None
@@ -215,24 +198,28 @@ def _nearest_period_end(
     return best
 
 
-def suggest_cut_points(words: list[Word], language: str = "auto") -> tuple[list[float], list[float]]:
-    """Retorna (item_cuts, soft_cuts), todos ja snapados para o fim da frase
-    mais proxima.
+def suggest_cut_points(words: list[Word], language: str = "auto") -> list[float]:
+    """Retorna uma lista unica de cut_points (em segundos), ja snapados para
+    o fim da frase mais proxima. Combina:
 
-    - item_cuts: fronteiras OBRIGATORIAS entre itens da lista TOP-N (regex).
-      Snapadas para o ponto final imediatamente ANTES do anuncio do item.
-    - soft_cuts: sugestoes do Claude para sub-contextos. Snapadas para o ponto
-      final mais proximo (janela +- PERIOD_LOOKBACK/AHEAD). Cortes sem ponto
-      final na janela sao DESCARTADOS. Inclui segunda passada para secoes que
-      ainda excedem MAX_SECTION_DURATION.
+    - fronteiras OBRIGATORIAS de item da lista TOP-N (regex deterministico),
+      snapadas para o ponto final imediatamente ANTES do anuncio;
+    - sugestoes do Claude para sub-contextos (snapadas para o ponto final
+      mais proximo; descartadas quando nao ha ponto final na janela);
+    - cortes da segunda passada do Claude para secoes ainda > MAX_SECTION_DURATION.
+
+    Cortes suaves a menos de MIN_SCENE_DURATION de qualquer fronteira de item
+    sao descartados — o anuncio do item sempre vence.
     """
+    if not words:
+        return []
+
     item_cuts_raw = detect_item_boundaries(words)
     if item_cuts_raw:
         _log(f"Detectadas {len(item_cuts_raw)} fronteiras de item via regex: "
              f"{[f'{c:.1f}s' for c in item_cuts_raw]}")
 
-    # Snap item_cuts para o ponto final imediatamente ANTES do anuncio do item
-    # (lookback generoso, lookahead minimo).
+    # Snap item cuts para o ponto final imediatamente ANTES do anuncio.
     item_cuts: list[float] = []
     for ic in item_cuts_raw:
         snapped = _nearest_period_end(words, ic, lookback=PERIOD_LOOKBACK, lookahead=0.5)
@@ -241,7 +228,7 @@ def suggest_cut_points(words: list[Word], language: str = "auto") -> tuple[list[
 
     llm_cuts = _suggest_cut_points_llm(words, language=language)
 
-    # Snap soft_cuts; descarta os que nao tem ponto final na janela.
+    # Snap soft cuts; descarta os sem ponto final na janela.
     soft_cuts: list[float] = []
     dropped = 0
     for c in llm_cuts:
@@ -254,13 +241,10 @@ def suggest_cut_points(words: list[Word], language: str = "auto") -> tuple[list[
         _log(f"{dropped} corte(s) suave(s) descartado(s): sem ponto final num raio de "
              f"{PERIOD_LOOKBACK:.0f}s/{PERIOD_LOOKAHEAD:.0f}s.")
 
-    # Item_cuts dominam: descarta soft_cuts a menos de MIN_SCENE_DURATION de
-    # qualquer item_cut. Isso garante que o anuncio do item nunca seja engolido
-    # por um corte suave anterior nem fragmentado por um corte logo apos.
+    # Item cuts dominam: descarta soft cuts muito proximos.
     soft_cuts = _drop_close_to_items(soft_cuts, item_cuts)
 
-    # Segunda passada: identifica secoes que ainda excedem MAX_SECTION_DURATION
-    # e pede ao Claude cortes coerentes especificamente nelas.
+    # Segunda passada para secoes ainda > MAX_SECTION_DURATION.
     extra = _resuggest_for_long_sections(
         words=words,
         item_cuts=item_cuts,
@@ -275,7 +259,7 @@ def suggest_cut_points(words: list[Word], language: str = "auto") -> tuple[list[
             soft_cuts.append(snapped)
         soft_cuts = _drop_close_to_items(soft_cuts, item_cuts)
 
-    # Dedup final: ordena e remove cortes a menos de MIN_SCENE_DURATION entre si.
+    # Dedup final.
     soft_cuts = sorted(set(soft_cuts))
     deduped: list[float] = []
     for c in soft_cuts:
@@ -284,7 +268,7 @@ def suggest_cut_points(words: list[Word], language: str = "auto") -> tuple[list[
         deduped.append(c)
     soft_cuts = deduped
 
-    return item_cuts, soft_cuts
+    return sorted(set(item_cuts) | set(soft_cuts))
 
 
 def _drop_close_to_items(soft_cuts: list[float], item_cuts: list[float]) -> list[float]:
@@ -299,7 +283,6 @@ def _drop_close_to_items(soft_cuts: list[float], item_cuts: list[float]) -> list
 def _find_long_sections(
     audio_start: float, audio_end: float, boundaries: list[float]
 ) -> list[tuple[float, float]]:
-    """Devolve pares (a, b) onde b - a > MAX_SECTION_DURATION."""
     starts = sorted({audio_start, audio_end, *boundaries})
     return [
         (a, b)
@@ -314,17 +297,12 @@ def _resuggest_for_long_sections(
     soft_cuts: list[float],
     language: str,
 ) -> list[float]:
-    """Para cada secao ainda > MAX_SECTION_DURATION, faz uma chamada focada ao
-    Claude pedindo cortes coerentes dentro do trecho. Retorna a lista mesclada
-    de novos cortes (em segundos absolutos).
-    """
+    """Segunda passada focada em trechos ainda > MAX_SECTION_DURATION."""
     if not words:
         return []
     audio_start = words[0].start
     audio_end = words[-1].end
-    long_sections = _find_long_sections(
-        audio_start, audio_end, item_cuts + soft_cuts
-    )
+    long_sections = _find_long_sections(audio_start, audio_end, item_cuts + soft_cuts)
     if not long_sections:
         return []
 
@@ -391,7 +369,6 @@ def _resuggest_for_long_sections(
                 if not isinstance(c, (int, float)):
                     continue
                 cf = float(c)
-                # So aceita cortes que estao DENTRO da secao com folga.
                 if sec_start + 5.0 <= cf <= sec_end - 5.0:
                     new_cuts.append(cf)
         except (json.JSONDecodeError, TypeError, ValueError):
@@ -409,8 +386,7 @@ def _suggest_cut_points_llm(words: list[Word], language: str = "auto") -> list[f
 
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
-        _log("ANTHROPIC_API_KEY nao definida — pulando Claude. "
-             "Defina a variavel de ambiente para ativar a divisao inteligente de cenas.")
+        _log("ANTHROPIC_API_KEY nao definida — pulando Claude.")
         return []
 
     try:
