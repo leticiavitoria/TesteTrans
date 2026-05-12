@@ -151,4 +151,12 @@ def build_scenes(words: list[Word], cut_points: list[float] | None = None) -> li
 
         scenes.append(scene)
 
+    # Descarta cena final vazia ou degenerada (BASE com <1s e sem texto).
+    if scenes:
+        last = scenes[-1]
+        if last.prompts:
+            p0 = last.prompts[0]
+            if p0.end - p0.start < 1.0 and not p0.text.strip():
+                scenes.pop()
+
     return scenes

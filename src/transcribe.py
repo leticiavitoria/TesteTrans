@@ -50,6 +50,7 @@ def transcribe(audio_path: str, model_size: str = "large-v3") -> tuple[list[Word
         audio_path,
         word_timestamps=True,
         vad_filter=True,
+        condition_on_previous_text=False,
     )
 
     total_duration = float(getattr(info, "duration", 0.0) or 0.0)
