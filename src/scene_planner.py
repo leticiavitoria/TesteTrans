@@ -13,6 +13,10 @@ from .transcribe import Word
 CLAUDE_MODEL = "claude-opus-4-6"
 MAX_SECTION_DURATION = 148.0  # = BASE_DURATION + MAX_EXT_PER_SCENE * EXT_DURATION
 TARGET_MAX_SECTION = 140.0    # alvo recomendado ao Claude (folga de 8s)
+MIN_SCENE_DURATION = 8.0      # = BASE_DURATION; precisa bater com segmenter
+PERIOD_LOOKBACK = 8.0         # janela para tras ao snap de cortes em ponto final
+PERIOD_LOOKAHEAD = 5.0        # janela para frente ao snap de cortes em ponto final
+SENTENCE_ENDERS = (".", "!", "?")
 
 
 SYSTEM_PROMPT = (
@@ -46,6 +50,9 @@ SYSTEM_PROMPT = (
     "4. O FECHAMENTO/OUTRO (recapitulacao, CTA, despedida apos o item 1) "
     "deve ser pelo menos uma cena propria, possivelmente quebrada em recapitulacao + CTA.\n\n"
     "REGRAS GERAIS:\n"
+    "- Cada cut_point DEVE coincidir com o FIM de uma frase (palavra terminada em '.', '!' ou '?'). "
+    "Use os timestamps das palavras na transcricao — o cut_point e o instante final (end) da palavra "
+    "que encerra a frase. Cortes no meio de uma frase serao DESCARTADOS automaticamente.\n"
     "- Nao corte no meio de uma frase. Prefira o fim da sentenca antes do novo mini-contexto.\n"
     "- Cenas podem ter duracoes muito diferentes. NAO force tamanhos similares.\n"
     "- O numero TOTAL de cenas deve ser MAIOR que (intro + N itens + outro). "
@@ -64,7 +71,8 @@ LONG_SECTION_SYSTEM_PROMPT = (
     "cut_points DENTRO desse trecho que dividam a narrativa em sub-cenas coerentes, "
     f"de forma que NENHUMA sub-secao resultante exceda {TARGET_MAX_SECTION:.0f} segundos.\n\n"
     "Cada cut_point deve cair em uma troca real de sub-contexto narrativo (mudanca de foco, "
-    "de personagem, de tempo, ou fim de uma ideia inteira) — NUNCA no meio de uma frase. "
+    "de personagem, de tempo, ou fim de uma ideia inteira) e DEVE coincidir com o fim de uma "
+    "frase (palavra terminada em '.', '!' ou '?'). NUNCA corte no meio de uma frase. "
     "Use o conteudo do texto como guia: pense em cada sub-cena como uma 'unidade visual' "
     "distinta. NAO retorne os limites externos do trecho — somente os cortes INTERNOS.\n\n"
     "Responda APENAS com JSON valido no formato: "
@@ -176,30 +184,80 @@ def detect_item_boundaries(words: list[Word]) -> list[float]:
     return boundaries
 
 
+def _is_sentence_end(word_text: str) -> bool:
+    t = word_text.strip()
+    if not t or t.endswith(".."):
+        return False
+    return t.endswith(SENTENCE_ENDERS)
+
+
+def _nearest_period_end(
+    words: list[Word], target: float, lookback: float, lookahead: float
+) -> float | None:
+    """Retorna o end-time da palavra terminada em '.', '!' ou '?' mais proxima
+    de `target` dentro de [target - lookback, target + lookahead].
+    None se nao houver."""
+    lo = target - lookback
+    hi = target + lookahead
+    best: float | None = None
+    best_dist = float("inf")
+    for w in words:
+        if w.end < lo - 1e-6:
+            continue
+        if w.end > hi + 1e-6:
+            break
+        if not _is_sentence_end(w.text):
+            continue
+        d = abs(w.end - target)
+        if d < best_dist:
+            best_dist = d
+            best = w.end
+    return best
+
+
 def suggest_cut_points(words: list[Word], language: str = "auto") -> tuple[list[float], list[float]]:
-    """Retorna (item_cuts, soft_cuts).
+    """Retorna (item_cuts, soft_cuts), todos ja snapados para o fim da frase
+    mais proxima.
 
     - item_cuts: fronteiras OBRIGATORIAS entre itens da lista TOP-N (regex).
-      Podem encurtar o prompt anterior abaixo do minimo, para que o BASE
-      da nova cena comece exatamente no anuncio do item.
-    - soft_cuts: sugestoes do Claude para sub-contextos. Inclui uma segunda
-      passada focada em secoes que ainda estao acima de MAX_SECTION_DURATION
-      apos a primeira chamada.
+      Snapadas para o ponto final imediatamente ANTES do anuncio do item.
+    - soft_cuts: sugestoes do Claude para sub-contextos. Snapadas para o ponto
+      final mais proximo (janela +- PERIOD_LOOKBACK/AHEAD). Cortes sem ponto
+      final na janela sao DESCARTADOS. Inclui segunda passada para secoes que
+      ainda excedem MAX_SECTION_DURATION.
     """
-    item_cuts = detect_item_boundaries(words)
-    if item_cuts:
-        _log(f"Detectadas {len(item_cuts)} fronteiras de item via regex: "
-             f"{[f'{c:.1f}s' for c in item_cuts]}")
+    item_cuts_raw = detect_item_boundaries(words)
+    if item_cuts_raw:
+        _log(f"Detectadas {len(item_cuts_raw)} fronteiras de item via regex: "
+             f"{[f'{c:.1f}s' for c in item_cuts_raw]}")
+
+    # Snap item_cuts para o ponto final imediatamente ANTES do anuncio do item
+    # (lookback generoso, lookahead minimo).
+    item_cuts: list[float] = []
+    for ic in item_cuts_raw:
+        snapped = _nearest_period_end(words, ic, lookback=PERIOD_LOOKBACK, lookahead=0.5)
+        item_cuts.append(snapped if snapped is not None else ic)
+    item_cuts = sorted(item_cuts)
 
     llm_cuts = _suggest_cut_points_llm(words, language=language)
 
-    # Remove cortes do LLM que estao muito proximos de uma fronteira de item
-    # (a fronteira deterministica ja faz o mesmo papel).
+    # Snap soft_cuts; descarta os que nao tem ponto final na janela.
     soft_cuts: list[float] = []
+    dropped = 0
     for c in llm_cuts:
-        if any(abs(c - ic) < 1.5 for ic in item_cuts):
+        snapped = _nearest_period_end(words, c, lookback=PERIOD_LOOKBACK, lookahead=PERIOD_LOOKAHEAD)
+        if snapped is None:
+            dropped += 1
             continue
-        soft_cuts.append(c)
+        soft_cuts.append(snapped)
+    if dropped:
+        _log(f"{dropped} corte(s) suave(s) descartado(s): sem ponto final num raio de "
+             f"{PERIOD_LOOKBACK:.0f}s/{PERIOD_LOOKAHEAD:.0f}s.")
+
+    # Item_cuts dominam: descarta soft_cuts a menos de MIN_SCENE_DURATION de
+    # qualquer item_cut. Isso garante que o anuncio do item nunca seja engolido
+    # por um corte suave anterior nem fragmentado por um corte logo apos.
+    soft_cuts = _drop_close_to_items(soft_cuts, item_cuts)
 
     # Segunda passada: identifica secoes que ainda excedem MAX_SECTION_DURATION
     # e pede ao Claude cortes coerentes especificamente nelas.
@@ -210,17 +268,32 @@ def suggest_cut_points(words: list[Word], language: str = "auto") -> tuple[list[
         language=language,
     )
     if extra:
-        merged = soft_cuts + extra
-        # Dedup contra item_cuts e contra cortes muito proximos entre si.
-        soft_cuts = []
-        for c in sorted(merged):
-            if any(abs(c - ic) < 1.5 for ic in item_cuts):
+        for e in extra:
+            snapped = _nearest_period_end(words, e, lookback=PERIOD_LOOKBACK, lookahead=PERIOD_LOOKAHEAD)
+            if snapped is None:
                 continue
-            if soft_cuts and c - soft_cuts[-1] < 1.5:
-                continue
-            soft_cuts.append(c)
+            soft_cuts.append(snapped)
+        soft_cuts = _drop_close_to_items(soft_cuts, item_cuts)
 
-    return sorted(item_cuts), sorted(soft_cuts)
+    # Dedup final: ordena e remove cortes a menos de MIN_SCENE_DURATION entre si.
+    soft_cuts = sorted(set(soft_cuts))
+    deduped: list[float] = []
+    for c in soft_cuts:
+        if deduped and c - deduped[-1] < MIN_SCENE_DURATION:
+            continue
+        deduped.append(c)
+    soft_cuts = deduped
+
+    return item_cuts, soft_cuts
+
+
+def _drop_close_to_items(soft_cuts: list[float], item_cuts: list[float]) -> list[float]:
+    out: list[float] = []
+    for s in soft_cuts:
+        if any(abs(s - i) < MIN_SCENE_DURATION for i in item_cuts):
+            continue
+        out.append(s)
+    return out
 
 
 def _find_long_sections(
